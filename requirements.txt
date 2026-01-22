@@ -1,0 +1,6 @@
+streamlit
+google-genai
+groq
+python-docx
+reportlab
+pyngrok
