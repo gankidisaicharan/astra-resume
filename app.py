@@ -1,5 +1,4 @@
 # Cell 2: Astra Ultimate (Smart Reset Edition)
-%%writefile app.py
 import streamlit as st
 import json
 import re
