@@ -108,7 +108,7 @@ class SkillCategory(BaseModel):
 class ResumeSchema(BaseModel):
     candidate_name: str = Field(description="Full Name of the candidate")
     candidate_title: str = Field(description="Professional Title (e.g. Senior Software Engineer)")
-    contact_info: str = Field(description="Phone | Email | Location | LinkedIn (formatted as string)")
+    contact_info: str = Field(description="Phone | Email | Location")
     summary: str = Field(description="A strong professional summary tailored to the JD")
     skills: List[SkillCategory] = Field(description="List of 6-7 skill categories relevant to the job.")
     experience: List[ExperienceItem] = Field(description="List of professional roles. Must include ALL roles from input.")
