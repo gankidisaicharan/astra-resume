@@ -7,6 +7,12 @@ import time
 import ast
 import datetime
 import uuid
+from typing import List, Dict, Optional
+
+# --- NEW IMPORTS FOR PYDANTIC ---
+from pydantic import BaseModel, Field
+
+# --- EXISTING LIBRARIES ---
 from google import genai
 from google.genai import types
 from groq import Groq
@@ -25,18 +31,35 @@ from xml.sax.saxutils import escape
 
 # --- 1. CONFIGURATION ---
 PAGE_TITLE = "Astra Resume Engine"
-ASTRA_PROMPT = """
-Role: You are Astra, a Senior Technical Recruiter.
-Objective: Rewrite the resume to match the JD with 98% alignment.
 
-CRITICAL OUTPUT RULES:
-1. OUTPUT JSON ONLY.
-2. KEYS: 'candidate_name', 'candidate_title', 'contact_info', 'summary', 'skills', 'experience', 'education', 'target_company'.
-3. SKILLS: Dense 6-7 categories. Values must be comma-separated strings.
-4. EXPERIENCE: Must include 'role_title', 'company', 'dates', 'location', 'responsibilities' (list), 'achievements' (list).
-   - CRITICAL: Do NOT drop any roles. Include ALL experience entries from the input. If the candidate has 4, 5, or more roles, YOU MUST OUTPUT THEM ALL.
-5. EDUCATION: Return a LIST of objects: [{"degree": "...", "college": "..."}].
-6. TARGET COMPANY: Extract the company name from the JD text. If not found, return "Company".
+# Updated Prompt to be compatible with Pydantic
+ASTRA_PROMPT = """
+Role: You are Astra, a Senior Technical Recruiter and Career Strategist.
+Objective: Rewrite the resume to match the Job Description (JD) with 98% alignment, focusing on Narrative Fit, not just Keyword Matching.
+
+CRITICAL STRATEGIC INSTRUCTIONS:
+
+1. THE "DOMAIN BRIDGE" PROTOCOL (Fixing Domain Gaps):
+   - Analyze the JD's specific industry context (e.g., IT Service Management, Fintech, Healthcare).
+   - If the Candidate's experience is in a different domain (e.g., Pricing, Publishing), you must REFRAME their experience to highlight TRANSFERABLE MECHANISMS.
+   - Example: If the candidate did "Dynamic Pricing" (predicting demand) but the JD is "IT Help Desk" (predicting tickets):
+     - BAD: "Optimized pricing elasticity models." (Irrelevant)
+     - GOOD: "Built real-time demand prediction models (Dynamic Pricing) transferable to forecasting IT ticket volume and optimizing service agent allocation."
+   - *Rule:* Do not just list what they did; explicitly frame the bullet point to solve the JD's specific business problem.
+
+2. THE "PHILOSOPHY MATCH" PROTOCOL (Fixing Tone Gaps):
+   - Analyze the JD for "Cultural Vibe" keywords (e.g., "Scrappy," "Simple solutions," "One-liners" VS. "Enterprise," "Governance," "Complex Architectures").
+   - If the JD asks for "Simple/Scrappy," DO NOT over-emphasize complex LLM/RAG architectures if a simple SQL/Python solution would have worked.
+   - *Mandatory:* If the JD values simplicity, rewrite one bullet point to demonstrate "The Right Tool for the Job" (e.g., "Solved X using a lightweight SQL script where a complex model was unnecessary, reducing maintenance overhead by 50%").
+
+3. EXECUTION GUIDELINES:
+   - SUMMARY: Rewrite to be punchy. Explicitly mention the target role and how the candidate's background solves the JD's primary "Pain Point."
+   - SKILLS: Create 6-7 dense categories. Ensure specific tools mentioned in the JD are prioritized here.
+   - EXPERIENCE: 
+     - Do NOT drop any roles. Include ALL experience entries.
+     - Rewrite bullets to focus on metrics.
+     - *Crucial:* If the JD mentions specific soft skills (e.g., "Communicating to non-tech"), ensure at least one bullet point proves this capability.
+   - TARGET COMPANY: Extract the exact company name from the JD.
 """
 
 COVER_LETTER_PROMPT = """
@@ -54,19 +77,69 @@ CRITICAL "NO-ROBOT" RULES:
 
 STRUCTURE:
 1. **Salutation:** "Dear Hiring Manager," (or specific name if found).
-2. **The Hook:** Connect immediately to the company's pain point (e.g., scaling, compliance, efficiency).
+2. **The Hook:** Connect immediately to the company's pain point.
 3. **The Bridge:** "This challenge resonates with me because..."
-4. **The Evidence:** The "War Story" (detailed above). Mention specific tools (dbt, Snowflake, etc.) naturally in context.
-5. **The Closing:** Brief and confident. "I’d love to discuss how I can bring this rigor to [Target Company]."
+4. **The Evidence:** The "War Story" (detailed above). Mention specific tools naturally.
+5. **The Closing:** Brief and confident.
 
 FORMATTING:
-- **Salutation:** Start strictly with "Dear Hiring Team," and end strictly with Thank you.
+- **Salutation:** Start strictly with "Dear Hiring Team," (or name) and end strictly with Thank you.
 - Return ONLY the body text.
-- Use standard paragraph breaks (double newline).
-- No placeholders.
+- Use standard paragraph breaks.
 """
 
-# --- 2. DATA NORMALIZER ---
+# --- 2. PYDANTIC SCHEMAS ---
+class ExperienceItem(BaseModel):
+    role_title: str = Field(description="The job title")
+    company: str = Field(description="The company name")
+    dates: str = Field(description="Employment dates (e.g., 'Jan 2020 - Present')")
+    location: str = Field(description="City, State or Remote")
+    responsibilities: List[str] = Field(description="List of 6-8 bullet points focusing on duties")
+    achievements: List[str] = Field(description="List of 2-3 specific quantified wins or metrics")
+
+class EducationItem(BaseModel):
+    degree: str = Field(description="Degree name (e.g., B.S. Computer Science)")
+    college: str = Field(description="University or Institution name")
+
+class SkillCategory(BaseModel):
+    category: str = Field(description="Name of the skill category (e.g., 'Programming Languages', 'Cloud Infrastructure')")
+    technologies: str = Field(description="Comma-separated list of tools/skills (e.g., 'Python, Java, C++')")
+
+class ResumeSchema(BaseModel):
+    candidate_name: str = Field(description="Full Name of the candidate")
+    candidate_title: str = Field(description="Professional Title (e.g. Senior Software Engineer)")
+    contact_info: str = Field(description="Phone | Email | Location | LinkedIn (formatted as string)")
+    summary: str = Field(description="A strong professional summary tailored to the JD")
+    skills: List[SkillCategory] = Field(description="List of 6-7 skill categories relevant to the job.")
+    experience: List[ExperienceItem] = Field(description="List of professional roles. Must include ALL roles from input.")
+    education: List[EducationItem] = Field(description="List of educational background")
+    target_company: str = Field(description="Name of the company applying to, extracted from JD")
+
+# --- HELPER TO FIX GEMINI API ERROR ---
+def get_clean_schema(pydantic_cls):
+    """
+    Generates a JSON schema from a Pydantic class and recursively removes 
+    'additionalProperties' and 'title' fields which the Gemini API rejects.
+    """
+    schema = pydantic_cls.model_json_schema()
+
+    def _clean(d):
+        if isinstance(d, dict):
+            # Remove forbidden keys
+            for key in ["additionalProperties", "title"]:
+                if key in d:
+                    del d[key]
+            # Recursively clean nested dictionaries
+            for v in d.values():
+                _clean(v)
+        elif isinstance(d, list):
+            for item in d:
+                _clean(item)
+    
+    _clean(schema)
+    return schema
+
+# --- 3. DATA NORMALIZER ---
 def clean_skill_string(skill_str):
     if not isinstance(skill_str, str): return str(skill_str)
     if skill_str.strip().startswith("["):
@@ -153,7 +226,7 @@ def normalize_schema(data):
 
     return normalized
 
-# --- 3. JUDGE & UTILS ---
+# --- 4. JUDGE & UTILS (FIXED GROQ SCORE) ---
 def calculate_groq_score(resume_json, jd_text, groq_api_key):
     if not groq_api_key: return {"score": 0, "reasoning": "No Groq Key"}
     client = Groq(api_key=groq_api_key)
@@ -165,26 +238,25 @@ def calculate_groq_score(resume_json, jd_text, groq_api_key):
         RESUME: {str(resume_json)[:2500]}
         JD: {jd_text[:2500]}
         """
+        # User requested model name kept exactly as is
         completion = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"}
         )
-        return json.loads(completion.choices[0].message.content)
-    except:
-        return {"score": 0, "reasoning": "Groq Error"}
-
-def repair_json(text):
-    text = text.strip()
-    if "```" in text:
-        match = re.search(r"```(?:json)?(.*?)```", text, re.DOTALL)
-        if match: return json.loads(match.group(1))
-    try:
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        return json.loads(text[start:end])
-    except:
-        return None
+        
+        content = completion.choices[0].message.content.strip()
+        
+        # FIX: Clean Markdown backticks if present (Llama often adds them)
+        if "```" in content:
+            match = re.search(r"```(?:json)?(.*?)```", content, re.DOTALL)
+            if match:
+                content = match.group(1).strip()
+        
+        return json.loads(content)
+    except Exception as e:
+        # FIX: Return the actual error message so you can see why it's failing in the UI
+        return {"score": 0, "reasoning": f"Groq API Error: {str(e)}"}
 
 def expand_skills_dense(skills):
     if not skills: return {}
@@ -201,30 +273,52 @@ def to_text_block(val):
     if isinstance(val, list): return "\n".join([str(x) for x in val])
     return str(val)
 
-# --- 4. GENERATION ---
+# --- 5. GENERATION ---
 def analyze_and_generate(google_key, groq_key, resume_text, jd_text):
     client = genai.Client(api_key=google_key)
     try:
+        # Get clean schema
+        safe_schema = get_clean_schema(ResumeSchema)
+
+        # User requested model name kept exactly as is
         response = client.models.generate_content(
             model="gemini-flash-latest",
             contents=f"{ASTRA_PROMPT}\n\nRESUME:\n{resume_text}\n\nJD:\n{jd_text}",
-            config=types.GenerateContentConfig(response_mime_type="application/json")
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=safe_schema 
+            )
         )
         
-        raw_data = repair_json(response.text)
-        if not raw_data: return {"error": "Parsing Failed", "raw": response.text}
+        raw_data = json.loads(response.text)
         
-        data = normalize_schema(raw_data)
+        if hasattr(raw_data, 'model_dump'):
+            data = raw_data.model_dump()
+        else:
+            data = raw_data
+
+        # Transform Skills back to Dictionary for UI compatibility
+        if 'skills' in data and isinstance(data['skills'], list):
+            transformed_skills = {}
+            for item in data['skills']:
+                cat = item.get('category') if isinstance(item, dict) else item.category
+                tech = item.get('technologies') if isinstance(item, dict) else item.technologies
+                if cat and tech:
+                    transformed_skills[cat] = tech
+            data['skills'] = transformed_skills
+
+        data = normalize_schema(data)
         data['skills'] = expand_skills_dense(data.get('skills', {}))
         
+        # Calculate Score
         judge = calculate_groq_score(data, jd_text, groq_key)
         data['ats_score'] = judge.get('score', 0)
-        data['ats_reason'] = judge.get('reasoning', '')
+        # Capture reasoning or error message here
+        data['ats_reason'] = judge.get('reasoning', 'Unknown Error')
         
-        data['raw_debug'] = raw_data
         return data
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"Generation Error: {str(e)}"}
 
 def generate_cover_letter(google_key, resume_data, jd_text):
     client = genai.Client(api_key=google_key)
@@ -237,7 +331,7 @@ def generate_cover_letter(google_key, resume_data, jd_text):
     except Exception as e:
         return f"Error generating cover letter: {str(e)}"
 
-# --- 5. DOCX RENDERERS ---
+# --- 6. DOCX RENDERERS ---
 def set_font(run, size, bold=False):
     run.font.name = 'Times New Roman'
     run.font.size = Pt(size)
@@ -306,7 +400,8 @@ def create_doc(data):
         if achs:
             p = doc.add_paragraph()
             p.indent_level = 1
-            p.paragraph_format.space_before = Pt(2)
+            p.paragraph_format.space_before = Pt(0) # Tighten space between Responsibilities and "Achievements:"
+            p.paragraph_format.space_after = Pt(0)  # Tighten space between "Achievements:" and the first bullet
             set_font(p.add_run("Achievements:"), 12, True)
             for a in achs: add_body(a, bullet=True)
 
@@ -317,14 +412,12 @@ def create_doc(data):
         
     return doc
 
-# --- CORRECTED COVER LETTER DOCX RENDERER ---
+# --- 7. COVER LETTER DOCX RENDERER ---
 def create_cover_letter_doc(cover_letter_text, data):
     doc = Document()
     s = doc.sections[0]
     s.left_margin = s.right_margin = s.top_margin = s.bottom_margin = Inches(0.5)
 
-    # Helper for consistent formatting
-    # FIXED: Added 'align' parameter to definition
     def add_line(text, bold=False, space_after=12, align=WD_PARAGRAPH_ALIGNMENT.LEFT):
         if not text: return
         p = doc.add_paragraph()
@@ -346,21 +439,20 @@ def create_cover_letter_doc(cover_letter_text, data):
     else:
         add_line(contact_info, bold=False, space_after=0, align=WD_PARAGRAPH_ALIGNMENT.LEFT)
 
-    # 3. DATE (Double Return Gap)
+    # 3. DATE
     doc.add_paragraph().paragraph_format.space_after = Pt(12) # Blank Line
     today_str = datetime.date.today().strftime("%B %d, %Y")
     add_line(today_str, space_after=12, align=WD_PARAGRAPH_ALIGNMENT.LEFT)
 
-    # 4. BODY CONTENT (Justified)
+    # 4. BODY CONTENT
     paragraphs = cover_letter_text.split('\n')
     for para in paragraphs:
         if para.strip():
-            # Apply Justify to body text
             add_line(para.strip(), bold=False, space_after=12, align=WD_PARAGRAPH_ALIGNMENT.JUSTIFY)
             
     return doc
 
-# --- 6. PDF RENDERER (FIXED) ---
+# --- 8. PDF RENDERER ---
 def create_pdf(data):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter,
@@ -427,11 +519,9 @@ def create_pdf(data):
     buffer.seek(0)
     return buffer.getvalue()
 
-# --- 8. UI LAYER (FIXED & VISIBLE SIDEBAR) ---
-# Added initial_sidebar_state="expanded" to FORCE the sidebar open
+# --- 9. UI LAYER ---
 st.set_page_config(page_title=PAGE_TITLE, layout="wide", page_icon="🚀", initial_sidebar_state="expanded")
 
-# Removed "header {visibility: hidden;}" so the sidebar toggle is VISIBLE even if you close it
 st.markdown("""
 <style>
     #MainMenu {visibility: hidden;}
@@ -465,7 +555,7 @@ with st.sidebar:
         st.session_state['saved_jd'] = ""
         st.session_state['cover_letter'] = None
         st.rerun()
-    st.caption(f"Astra Engine v2.5")
+    st.caption(f"Astra Engine v2.5 (Pydantic)")
 
 if not st.session_state['data']:
     st.markdown(f"<h1 style='text-align: center;'>{PAGE_TITLE}</h1>", unsafe_allow_html=True)
@@ -504,6 +594,9 @@ else:
         st.markdown(f"## 🎯 Target: {data.get('target_company', 'Company')}")
     with c3:
         st.metric("ATS Match", f"{data.get('ats_score', 0)}%")
+        # Display reason even if score is 0 so user knows WHY
+        if data.get('ats_score') == 0:
+            st.caption(f"Status: {data.get('ats_reason', 'N/A')}")
 
     # Professional Tabs
     tab_edit, tab_export, tab_cover = st.tabs(["📝 Content Editor", "🚀 Export Documents", "✍️ Cover Letter Strategy"])
@@ -603,7 +696,6 @@ else:
         if st.session_state['cover_letter']:
             st.text_area("Preview (Editable)", st.session_state['cover_letter'], height=400)
             
-            # FIXED: Passing 'data' dictionary, not 'c_name'
             cl_doc = create_cover_letter_doc(st.session_state['cover_letter'], data)
             bio_cl = io.BytesIO()
             cl_doc.save(bio_cl)
