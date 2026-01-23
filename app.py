@@ -34,6 +34,7 @@ CRITICAL OUTPUT RULES:
 2. KEYS: 'candidate_name', 'candidate_title', 'contact_info', 'summary', 'skills', 'experience', 'education', 'target_company'.
 3. SKILLS: Dense 6-7 categories. Values must be comma-separated strings.
 4. EXPERIENCE: Must include 'role_title', 'company', 'dates', 'location', 'responsibilities' (list), 'achievements' (list).
+   - CRITICAL: Do NOT drop any roles. Include ALL experience entries from the input. If the candidate has 4, 5, or more roles, YOU MUST OUTPUT THEM ALL.
 5. EDUCATION: Return a LIST of objects: [{"degree": "...", "college": "..."}].
 6. TARGET COMPANY: Extract the company name from the JD text. If not found, return "Company".
 """
