@@ -1,10 +1,11 @@
-# Cell 2: Astra Ultimate (Smart Reset Edition)
+# Cell 2: Astra Ultimate (Resume + Cover Letter Edition)
 import streamlit as st
 import json
 import re
 import io
 import time
 import ast
+import datetime
 import uuid
 from google import genai
 from google.genai import types
@@ -37,6 +38,33 @@ CRITICAL OUTPUT RULES:
 6. TARGET COMPANY: Extract the company name from the JD text. If not found, return "Company".
 """
 
+COVER_LETTER_PROMPT = """
+Role: You are the candidate (a Senior Industry Expert). You are writing a direct, high-impact email to a Hiring Manager.
+Objective: Write a cover letter that sounds 100% HUMAN, authentic, and specific. It must not sound like AI.
+
+CRITICAL "NO-ROBOT" RULES:
+1. **BANNED PHRASES:** NEVER use: "I am writing to express my interest," "I am excited to apply," "Please find my resume attached," "I believe I am a perfect fit," "testament to," "underscores," "pivotal," "realm," or "tapestry."
+2. **THE OPENING:** Do NOT start with who you are. Start with a "Hook"—an observation about the company's specific challenge (found in the JD) and why it's a hard problem to solve.
+   - *Bad:* "I am applying for the Data Scientist role."
+   - *Good:* "Scaling a data platform from 1 million to 20 million users breaks things—usually the semantic layer first."
+3. **THE "WAR STORY":** Do not summarize your resume. Instead, tell ONE specific "War Story" from your experience that proves you can solve their problem.
+   - Use the structure: "At [Company], we faced [Problem]. I built [Solution] using [Tool], which resulted in [Outcome]."
+4. **TONE:** Confident, conversational, and "peer-to-peer." Write as if you are discussing a project over coffee with the manager.
+
+STRUCTURE:
+1. **Salutation:** "Dear Hiring Manager," (or specific name if found).
+2. **The Hook:** Connect immediately to the company's pain point (e.g., scaling, compliance, efficiency).
+3. **The Bridge:** "This challenge resonates with me because..."
+4. **The Evidence:** The "War Story" (detailed above). Mention specific tools (dbt, Snowflake, etc.) naturally in context.
+5. **The Closing:** Brief and confident. "I’d love to discuss how I can bring this rigor to [Target Company]."
+
+FORMATTING:
+- **Salutation:** Start strictly with "Dear Hiring Team," and end strictly with Thank you.
+- Return ONLY the body text.
+- Use standard paragraph breaks (double newline).
+- No placeholders.
+"""
+
 # --- 2. DATA NORMALIZER ---
 def clean_skill_string(skill_str):
     if not isinstance(skill_str, str): return str(skill_str)
@@ -54,7 +82,7 @@ def clean_skill_string(skill_str):
 
 def normalize_schema(data):
     if not isinstance(data, dict): return {"summary": str(data), "skills": {}, "experience": []}
-
+    
     normalized = {}
 
     # 1. Contact/Name
@@ -107,7 +135,7 @@ def normalize_schema(data):
         for edu in raw_edu:
             if isinstance(edu, dict):
                 norm_edu.append({
-                    'degree': edu.get('degree', edu.get('Degree', '')),
+                    'degree': edu.get('degree', edu.get('Degree', '')), 
                     'college': edu.get('college', edu.get('Institution', ''))
                 })
             elif isinstance(edu, str):
@@ -130,7 +158,7 @@ def calculate_groq_score(resume_json, jd_text, groq_api_key):
     client = Groq(api_key=groq_api_key)
     try:
         prompt = f"""
-        You are an ATS. Compare this JSON Resume vs JD.
+        You are an ATS. Compare this JSON Resume vs JD. 
         Output STRICT JSON: {{'score': int, 'reasoning': '1 short sentence'}}
         SCORE 0-100.
         RESUME: {str(resume_json)[:2500]}
@@ -181,23 +209,34 @@ def analyze_and_generate(google_key, groq_key, resume_text, jd_text):
             contents=f"{ASTRA_PROMPT}\n\nRESUME:\n{resume_text}\n\nJD:\n{jd_text}",
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
-
+        
         raw_data = repair_json(response.text)
         if not raw_data: return {"error": "Parsing Failed", "raw": response.text}
-
+        
         data = normalize_schema(raw_data)
         data['skills'] = expand_skills_dense(data.get('skills', {}))
-
+        
         judge = calculate_groq_score(data, jd_text, groq_key)
         data['ats_score'] = judge.get('score', 0)
         data['ats_reason'] = judge.get('reasoning', '')
-
+        
         data['raw_debug'] = raw_data
         return data
     except Exception as e:
         return {"error": str(e)}
 
-# --- 5. DOCX RENDERER ---
+def generate_cover_letter(google_key, resume_data, jd_text):
+    client = genai.Client(api_key=google_key)
+    try:
+        response = client.models.generate_content(
+            model="gemini-flash-latest",
+            contents=f"{COVER_LETTER_PROMPT}\n\nRESUME DATA:\n{str(resume_data)}\n\nJOB DESCRIPTION:\n{jd_text}",
+        )
+        return response.text
+    except Exception as e:
+        return f"Error generating cover letter: {str(e)}"
+
+# --- 5. DOCX RENDERERS ---
 def set_font(run, size, bold=False):
     run.font.name = 'Times New Roman'
     run.font.size = Pt(size)
@@ -256,11 +295,11 @@ def create_doc(data):
         p.paragraph_format.space_after = Pt(0)
         line = f"{role.get('role_title')} | {role.get('company')} | {role.get('location')} | {role.get('dates')}"
         set_font(p.add_run(to_text_block(line)), 12, True)
-
+        
         resps = role.get('responsibilities', [])
         if isinstance(resps, str): resps = resps.split('\n')
         for r in resps: add_body(r, bullet=True)
-
+            
         achs = role.get('achievements', [])
         if isinstance(achs, str): achs = achs.split('\n')
         if achs:
@@ -274,7 +313,50 @@ def create_doc(data):
     for edu in data.get('education', []):
         text = f"{edu.get('degree', '')}, {edu.get('college', '')}"
         add_body(text, bullet=True)
+        
+    return doc
 
+# --- CORRECTED COVER LETTER DOCX RENDERER ---
+def create_cover_letter_doc(cover_letter_text, data):
+    doc = Document()
+    s = doc.sections[0]
+    s.left_margin = s.right_margin = s.top_margin = s.bottom_margin = Inches(0.5)
+
+    # Helper for consistent formatting
+    # FIXED: Added 'align' parameter to definition
+    def add_line(text, bold=False, space_after=12, align=WD_PARAGRAPH_ALIGNMENT.LEFT):
+        if not text: return
+        p = doc.add_paragraph()
+        p.alignment = align
+        p.paragraph_format.space_after = Pt(space_after)
+        run = p.add_run(str(text))
+        run.font.name = 'Times New Roman'
+        run.font.size = Pt(12)
+        run.bold = bold
+
+    # 1. NAME (Bold, Left)
+    add_line(data.get('candidate_name', '').upper(), bold=True, space_after=0, align=WD_PARAGRAPH_ALIGNMENT.LEFT)
+
+    # 2. CONTACT INFO (Stacked, Left)
+    contact_info = data.get('contact_info', '')
+    if "|" in contact_info:
+        for part in contact_info.split('|'):
+            add_line(part.strip(), bold=False, space_after=0, align=WD_PARAGRAPH_ALIGNMENT.LEFT)
+    else:
+        add_line(contact_info, bold=False, space_after=0, align=WD_PARAGRAPH_ALIGNMENT.LEFT)
+
+    # 3. DATE (Double Return Gap)
+    doc.add_paragraph().paragraph_format.space_after = Pt(12) # Blank Line
+    today_str = datetime.date.today().strftime("%B %d, %Y")
+    add_line(today_str, space_after=12, align=WD_PARAGRAPH_ALIGNMENT.LEFT)
+
+    # 4. BODY CONTENT (Justified)
+    paragraphs = cover_letter_text.split('\n')
+    for para in paragraphs:
+        if para.strip():
+            # Apply Justify to body text
+            add_line(para.strip(), bold=False, space_after=12, align=WD_PARAGRAPH_ALIGNMENT.JUSTIFY)
+            
     return doc
 
 # --- 6. PDF RENDERER (FIXED) ---
@@ -290,7 +372,7 @@ def create_pdf(data):
     style_header_contact = ParagraphStyle('AstraHeaderContact', parent=styles['Normal'], fontName='Times-Bold', fontSize=12, leading=14, alignment=TA_CENTER, spaceAfter=6)
     style_section = ParagraphStyle('AstraSection', parent=styles['Normal'], fontName='Times-Bold', fontSize=12, leading=14, alignment=TA_LEFT, spaceBefore=12, spaceAfter=2)
 
-    def clean(txt):
+    def clean(txt): 
         if txt is None: return ""
         txt = to_text_block(txt)
         return escape(txt).replace('\n', '<br/>')
@@ -315,14 +397,14 @@ def create_pdf(data):
         line = f"{role.get('role_title')} | {role.get('company')} | {role.get('location')} | {role.get('dates')}"
         elements.append(Paragraph(f"<b>{clean(line)}</b>", style_normal))
         elements.append(Spacer(1, 2))
-
+        
         role_bullets = []
         resps = role.get('responsibilities', [])
         if isinstance(resps, str): resps = resps.split('\n')
         for r in resps:
             if r.strip(): role_bullets.append(ListItem(Paragraph(clean(r), style_normal), leftIndent=0))
         if role_bullets: elements.append(ListFlowable(role_bullets, bulletType='bullet', start='•', leftIndent=15))
-
+            
         achs = role.get('achievements', [])
         if isinstance(achs, str): achs = achs.split('\n')
         if achs:
@@ -344,125 +426,208 @@ def create_pdf(data):
     buffer.seek(0)
     return buffer.getvalue()
 
-# --- 7. UI LAYER ---
-st.set_page_config(page_title=PAGE_TITLE, layout="wide")
+# --- 8. UI LAYER (FIXED & VISIBLE SIDEBAR) ---
+# Added initial_sidebar_state="expanded" to FORCE the sidebar open
+st.set_page_config(page_title=PAGE_TITLE, layout="wide", page_icon="🚀", initial_sidebar_state="expanded")
+
+# Removed "header {visibility: hidden;}" so the sidebar toggle is VISIBLE even if you close it
+st.markdown("""
+<style>
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    .block-container {padding-top: 1.5rem;}
+    div.stButton > button:first-child {
+        border-radius: 6px;
+        font-weight: 600;
+        text-transform: none;
+    }
+    div[data-testid="stMetricValue"] {
+        font-size: 1.8rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 if 'data' not in st.session_state: st.session_state['data'] = None
-# MEMORY FOR REDO
 if 'saved_base' not in st.session_state: st.session_state['saved_base'] = ""
 if 'saved_jd' not in st.session_state: st.session_state['saved_jd'] = ""
+if 'cover_letter' not in st.session_state: st.session_state['cover_letter'] = None
 
 with st.sidebar:
-    st.header("🔑 API Keys")
+    st.header("⚙️ Configuration")
     google_key = st.text_input("Google API Key", type="password")
     groq_key = st.text_input("Groq API Key", type="password")
-
+    
     st.divider()
-    if st.button("🗑️ Full Reset (Clear Everything)"):
+    if st.button("🗑️ Reset Application", use_container_width=True):
         st.session_state['data'] = None
         st.session_state['saved_base'] = ""
         st.session_state['saved_jd'] = ""
+        st.session_state['cover_letter'] = None
         st.rerun()
+    st.caption(f"Astra Engine v2.5")
 
 if not st.session_state['data']:
+    st.markdown(f"<h1 style='text-align: center;'>{PAGE_TITLE}</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center; color: #666;'>Enterprise-Grade Resume Architecture & Optimization</p>", unsafe_allow_html=True)
+    st.divider()
+    
     c1, c2 = st.columns(2)
-    # The 'value' is bound to session state, so it persists unless explicitly cleared
-    base = c1.text_area("Base Resume", st.session_state['saved_base'], height=300)
-    jd = c2.text_area("Job Description", st.session_state['saved_jd'], height=300)
-
-    if st.button("Generate Resume"):
+    with c1:
+        st.subheader("📋 Base Resume")
+        base = st.text_area("Paste your current resume here", st.session_state['saved_base'], height=400, label_visibility="collapsed")
+    with c2:
+        st.subheader("💼 Job Description")
+        jd = st.text_area("Paste the JD here", st.session_state['saved_jd'], height=400, label_visibility="collapsed")
+    
+    if st.button("✨ Architect My Application", type="primary", use_container_width=True):
         if google_key and groq_key and base and jd:
-            # SAVE INPUTS
             st.session_state['saved_base'] = base
             st.session_state['saved_jd'] = jd
-
-            with st.spinner("Astra Architecting..."):
+            
+            with st.spinner("Analyzing keywords, optimizing structure, and generating narrative..."):
                 data = analyze_and_generate(google_key, groq_key, base, jd)
                 if "error" in data: st.error(data['error'])
-                else:
+                else: 
                     st.session_state['data'] = data
                     st.rerun()
+        else:
+            st.warning("Please provide API Keys and both Resume/JD text.")
+
 else:
+    # --- DASHBOARD VIEW ---
     data = st.session_state['data']
-    st.metric("Groq ATS Score", f"{data.get('ats_score', 0)}%")
-    st.info(data.get('ats_reason', ''))
+    
+    # Top Metrics Bar
+    c1, c2, c3 = st.columns([1, 4, 1])
+    with c2:
+        st.markdown(f"## 🎯 Target: {data.get('target_company', 'Company')}")
+    with c3:
+        st.metric("ATS Match", f"{data.get('ats_score', 0)}%")
 
-    with st.form("edit_form"):
-        c1, c2, c3 = st.columns(3)
-        data['candidate_name'] = c1.text_input("Name", to_text_block(data.get('candidate_name')), key="name")
-        data['candidate_title'] = c2.text_input("Title", to_text_block(data.get('candidate_title')), key="title")
-        data['contact_info'] = c3.text_input("Contact", to_text_block(data.get('contact_info')), key="contact")
+    # Professional Tabs
+    tab_edit, tab_export, tab_cover = st.tabs(["📝 Content Editor", "🚀 Export Documents", "✍️ Cover Letter Strategy"])
 
-        data['summary'] = st.text_area("Summary", to_text_block(data.get('summary')), height=100, key="summary")
+    with tab_edit:
+        with st.form("edit_form"):
+            st.subheader("Candidate Details")
+            c1, c2, c3 = st.columns(3)
+            data['candidate_name'] = c1.text_input("Full Name", to_text_block(data.get('candidate_name')))
+            data['candidate_title'] = c2.text_input("Target Title", to_text_block(data.get('candidate_title')))
+            data['contact_info'] = c3.text_input("Contact String", to_text_block(data.get('contact_info')))
+            
+            data['summary'] = st.text_area("Professional Summary", to_text_block(data.get('summary')), height=120)
+            
+            st.subheader("Skills & Technologies")
+            skills = data.get('skills', {})
+            new_skills = {}
+            s_cols = st.columns(2)
+            for i, (k, v) in enumerate(skills.items()):
+                col = s_cols[i % 2]
+                new_val = col.text_area(k, to_text_block(v), key=f"skill_{i}", height=80)
+                new_skills[k] = new_val.replace('\n', ', ')
+            data['skills'] = new_skills
+            
+            st.subheader("Professional Experience")
+            for i, role in enumerate(data.get('experience', [])):
+                with st.expander(f"{role.get('role_title', 'Role')} @ {role.get('company', 'Company')}"):
+                    c1, c2 = st.columns(2)
+                    role['role_title'] = c1.text_input("Role Title", to_text_block(role.get('role_title')), key=f"job_title_{i}")
+                    role['company'] = c2.text_input("Company", to_text_block(role.get('company')), key=f"job_comp_{i}")
+                    c3, c4 = st.columns(2)
+                    role['dates'] = c3.text_input("Dates", to_text_block(role.get('dates')), key=f"job_dates_{i}")
+                    role['location'] = c4.text_input("Location", to_text_block(role.get('location')), key=f"job_loc_{i}")
+                    
+                    role['responsibilities'] = st.text_area("Responsibilities (Bullet Points)", to_text_block(role.get('responsibilities')), height=200, key=f"resp_{i}")
+                    role['achievements'] = st.text_area("Key Achievements", to_text_block(role.get('achievements')), height=100, key=f"ach_{i}")
 
-        st.subheader("Skills")
-        skills = data.get('skills', {})
-        new_skills = {}
-        for i, (k, v) in enumerate(skills.items()):
-            new_val = st.text_area(k, to_text_block(v), key=f"skill_{i}", height=70)
-            new_skills[k] = new_val.replace('\n', ', ')
-        data['skills'] = new_skills
-
-        st.subheader("Experience")
-        for i, role in enumerate(data.get('experience', [])):
-            with st.expander(f"Role {i+1}: {role.get('company', 'Company')}"):
-                c1, c2 = st.columns(2)
-                role['role_title'] = c1.text_input("Title", to_text_block(role.get('role_title')), key=f"job_title_{i}")
-                role['company'] = c2.text_input("Company", to_text_block(role.get('company')), key=f"job_comp_{i}")
-                c3, c4 = st.columns(2)
-                role['dates'] = c3.text_input("Dates", to_text_block(role.get('dates')), key=f"job_dates_{i}")
-                role['location'] = c4.text_input("Location", to_text_block(role.get('location')), key=f"job_loc_{i}")
-                resps = to_text_block(role.get('responsibilities'))
-                role['responsibilities'] = st.text_area("Responsibilities", resps, height=150, key=f"resp_{i}")
-                achs = to_text_block(role.get('achievements'))
-                role['achievements'] = st.text_area("Achievements", achs, height=100, key=f"ach_{i}")
-
-        st.subheader("Education")
-        education = data.get('education', [])
-        for i, edu in enumerate(education):
-            with st.expander(f"Education {i+1}"):
+            st.subheader("Education")
+            for i, edu in enumerate(data.get('education', [])):
                 c1, c2 = st.columns(2)
                 edu['degree'] = c1.text_input("Degree", to_text_block(edu.get('degree')), key=f"edu_deg_{i}")
-                edu['college'] = c2.text_input("College", to_text_block(edu.get('college')), key=f"edu_col_{i}")
+                edu['college'] = c2.text_input("Institution", to_text_block(edu.get('college')), key=f"edu_col_{i}")
 
-        if st.form_submit_button("Save Changes"):
-            st.session_state['data'] = data
-            st.success("Saved!")
-            st.rerun()
+            if st.form_submit_button("💾 Save Revisions", type="primary"):
+                st.session_state['data'] = data
+                st.success("Resume updated successfully!")
+                st.rerun()
 
-    st.subheader("Export Resume")
-    c_name = data.get('candidate_name', 'Candidate')
-    default_company = data.get('target_company', 'Company')
-    target_company = st.text_input("Target Company (for filename):", default_company)
-    safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', c_name.strip().replace(' ', '_'))
-    safe_company = re.sub(r'[^a-zA-Z0-9_-]', '_', target_company.strip())
-    final_filename = f"{safe_name}_{safe_company}"
+    with tab_export:
+        st.subheader("📥 Download Package")
+        c_name = data.get('candidate_name', 'Candidate')
+        default_company = data.get('target_company', 'Company')
+        target_company = st.text_input("Target Company Name (for file labeling)", default_company)
+        
+        safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', c_name.strip().replace(' ', '_'))
+        safe_company = re.sub(r'[^a-zA-Z0-9_-]', '_', target_company.strip())
+        final_filename = f"{safe_name}_{safe_company}"
+        
+        c1, c2 = st.columns(2)
+        
+        doc = create_doc(data)
+        bio = io.BytesIO()
+        doc.save(bio)
+        c1.download_button(
+            label="📄 Download Word Doc (Editable)",
+            data=bio.getvalue(),
+            file_name=f"{final_filename}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            type="primary",
+            use_container_width=True
+        )
+        
+        try:
+            pdf_data = create_pdf(data)
+            c2.download_button(
+                label="📕 Download PDF (Submission Ready)",
+                data=pdf_data,
+                file_name=f"{final_filename}.pdf",
+                mime="application/pdf",
+                type="secondary",
+                use_container_width=True
+            )
+        except Exception as e: c2.error(f"PDF Error: {e}")
 
-    c1, c2 = st.columns(2)
-    doc = create_doc(data)
-    bio = io.BytesIO()
-    doc.save(bio)
-    c1.download_button(label=f"📄 Download DOCX", data=bio.getvalue(), file_name=f"{final_filename}.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", type="primary")
+    with tab_cover:
+        st.subheader("✍️ Strategic Cover Letter")
+        st.info("This tool drafts a narrative-driven cover letter focusing on the specific pain points found in the Job Description.")
+        
+        if st.button("✨ Draft Cover Letter", type="primary"):
+            if google_key and st.session_state['saved_jd']:
+                with st.spinner("Analyzing JD pain points and drafting narrative..."):
+                    cl_text = generate_cover_letter(google_key, data, st.session_state['saved_jd'])
+                    st.session_state['cover_letter'] = cl_text
+            else:
+                st.warning("Please ensure API Key and Job Description are present.")
 
-    try:
-        pdf_data = create_pdf(data)
-        c2.download_button(label=f"📕 Download PDF", data=pdf_data, file_name=f"{final_filename}.pdf", mime="application/pdf", type="secondary")
-    except Exception as e: c2.error(f"PDF Error: {e}")
+        if st.session_state['cover_letter']:
+            st.text_area("Preview (Editable)", st.session_state['cover_letter'], height=400)
+            
+            # FIXED: Passing 'data' dictionary, not 'c_name'
+            cl_doc = create_cover_letter_doc(st.session_state['cover_letter'], data)
+            bio_cl = io.BytesIO()
+            cl_doc.save(bio_cl)
+            
+            st.download_button(
+                label="📄 Download Cover Letter (.docx)",
+                data=bio_cl.getvalue(),
+                file_name=f"Cover_Letter_{final_filename}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                type="primary"
+            )
 
-    # --- ACTION BUTTONS (SMART RESET) ---
     st.divider()
     c3, c4 = st.columns(2)
-
-    if c3.button("♻️ Redo / Improve"):
+    if c3.button("♻️ Re-Optimize (Redo)", use_container_width=True):
         if st.session_state['saved_base'] and st.session_state['saved_jd']:
             with st.spinner("Re-Architecting..."):
                 data = analyze_and_generate(google_key, groq_key, st.session_state['saved_base'], st.session_state['saved_jd'])
                 if "error" in data: st.error(data['error'])
-                else:
+                else: 
                     st.session_state['data'] = data
                     st.rerun()
-
-    if c4.button("Start New Application (Keeps Resume)"):
-        # Clear generated data and JD, but KEEP saved_base
+                    
+    if c4.button("New Application (Keep Resume)", use_container_width=True):
         st.session_state['data'] = None
-        st.session_state['saved_jd'] = ""
+        st.session_state['saved_jd'] = "" 
+        st.session_state['cover_letter'] = None
         st.rerun()
