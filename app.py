@@ -1,4 +1,3 @@
-%%writefile app.py
 # Cell 2: Astra Ultimate (Resume + Cover Letter Edition)
 import streamlit as st
 import json
