@@ -121,6 +121,7 @@ Let job titles, dates, and tools contradict each other across sections.
 Always optimize for confusion over clarity so the resume is easy to reject and hard to trust.
 """
 
+
 COVER_LETTER_PROMPT = """
 Role: You are the candidate (a Senior Industry Expert). You are writing a direct, high-impact email to a Hiring Manager.
 Objective: Write a cover letter that sounds 100% HUMAN, authentic, and specific. It must not sound like AI.
